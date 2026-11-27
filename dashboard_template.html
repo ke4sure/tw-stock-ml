@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>台股選股模型儀表板</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+body{font-family:"Microsoft JhengHei","PingFang TC","Noto Sans TC",sans-serif;margin:0;background:#f4f5f7;color:#1f2328}
+header{background:#1f2d3d;color:#fff;padding:18px 24px}
+header h1{margin:0;font-size:21px;font-weight:600}
+header p{margin:6px 0 0;opacity:.8;font-size:13px}
+nav{background:#fff;border-bottom:1px solid #e3e3e3;padding:0 16px;position:sticky;top:0;z-index:5;overflow-x:auto;white-space:nowrap}
+nav a{display:inline-block;padding:11px 12px;color:#444;text-decoration:none;font-size:14px}
+nav a:hover{color:#185FA5}
+main{max-width:1200px;margin:0 auto;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+.card{background:#fff;border-radius:10px;padding:13px 15px;box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.k{font-size:12.5px;color:#666}.v{font-size:23px;font-weight:600;margin-top:4px}.s{font-size:12px;color:#888;margin-top:3px;line-height:1.5}
+section{background:#fff;border-radius:10px;padding:18px 20px;margin-top:18px;box-shadow:0 1px 2px rgba(0,0,0,.08);scroll-margin-top:50px}
+section .card{box-shadow:none;border:1px solid #e6e6e6}
+h2{font-size:17px;margin:0 0 4px}h3{font-size:15px;margin:18px 0 6px}
+.hint{font-size:13px;color:#666;margin:0 0 12px;line-height:1.65}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th,td{padding:7px 9px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap}
+th{background:#fafafa;position:sticky;top:0;cursor:pointer;user-select:none;z-index:1}
+td.l,th.l{text-align:left}
+.up{color:#c62828}.down{color:#2e7d32}
+tr.watch td{background:#fff8e1}
+.scroll{max-height:540px;overflow:auto;border:1px solid #eee;border-radius:8px}
+.bar{display:inline-block;height:8px;border-radius:4px;background:#378ADD;vertical-align:middle;margin-right:6px}
+input,select{padding:7px 10px;border:1px solid #ccc;border-radius:6px;font-size:14px;margin:0 6px 10px 0}
+.warn{background:#fff4e5;border-left:4px solid #f0a020;padding:10px 14px;font-size:13px;line-height:1.65}
+.pending{color:#999}.good{color:#2e7d32;font-weight:600}.bad{color:#c62828;font-weight:600}
+.chartbox{position:relative;height:300px}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px}
+</style></head><body>
+<header><h1>台股選股模型儀表板 v3</h1><p id="meta"></p></header>
+<nav><a href="#watchsec">關注股票</a><a href="#ranksec">今日排名</a><a href="#livesec">預測 vs 實際</a><a href="#health">模型健康度</a><a href="#btsec">歷史回測</a><a href="#stocksec">個股對照</a></nav>
+<main>
+<div class="warn">
+<b>怎麼看分數:</b>「短期分數」是模型預測未來 <span class="H"></span> 個交易日、「長期分數」是未來約 1 年,這檔股票<b>相對其他股票</b>的表現排名(100% = 最看好)。這不是股價預測,也不代表一定會漲。
+模型的優勢很小,單一股票猜錯是常態;請先看「模型健康度」判斷值不值得參考。本頁僅供學習研究,不是投資建議。
+</div>
+<div class="grid" id="cards" style="margin-top:16px"></div>
+
+<section id="watchsec"><h2>你關注的股票</h2>
+<p class="hint">排名越前面、分數越接近 100%,代表模型越看好它接下來贏過其他股票。</p>
+<div class="grid" id="watch"></div></section>
+
+<section id="ranksec"><h2>今日完整排名</h2>
+<p class="hint">點欄位標題可以排序;黃底是你關注的股票。「產業中立」分數已扣掉產業和 beta(跟大盤連動程度)的影響,比較的是同產業、同風險的股票之間誰比較好。紅色上漲、綠色下跌。</p>
+<input id="q" placeholder="搜尋代號或名稱"><select id="ind"></select>
+<div class="scroll"><table id="rank"></table></div></section>
+
+<section id="livesec"><h2>預測 vs 實際:每日紀錄</h2>
+<p class="hint">網站每天更新時,會記錄當天短期分數前 <span class="N"></span> 檔。<span class="H"></span> 個交易日後自動填入實際結果,和「全部股票平均」比較;差距 &gt; 0 代表那次模型是對的。這是最真實的成績單。</p>
+<div class="scroll" style="max-height:360px"><table id="live"></table></div></section>
+
+<section id="health"><h2>模型健康度</h2>
+<p class="hint">四項檢查都過關,模型才算有參考價值:① Rank IC 穩定 &gt; 0.03 ② 五分組大致遞增 ③ 大部分年份贏過全部平均 ④ Sharpe 高於全部平均。以下都是「樣本外」結果:每次預測只用當時以前的資料。</p>
+<div id="checks" class="grid"></div>
+<div class="two">
+ <div><h3>Rank IC(預測分數和實際排名的相關係數)</h3><table id="ictab"></table>
+  <div id="longic"></div></div>
+ <div><h3>五分組:未來 <span class="H"></span> 日平均報酬</h3><div class="chartbox" style="height:240px"><canvas id="quint"></canvas></div></div>
+</div>
+<div class="two">
+ <div><h3>回測績效(每 <span class="H"></span> 天買前 <span class="N"></span> 檔,已扣交易成本)</h3><table id="sumtab"></table></div>
+ <div><h3>每年報酬</h3><div class="chartbox" style="height:260px"><canvas id="yearly"></canvas></div></div>
+</div>
+<h3>模型最依賴的特徵(前 15 名)</h3><div class="chartbox" style="height:360px"><canvas id="imp"></canvas></div>
+</section>
+
+<section id="btsec"><h2>歷史回測:累積淨值</h2>
+<p class="hint">上圖是累積淨值;下圖是每一期「綜合分數前 <span class="N"></span> 檔」贏過(紅)或輸給(綠)全部平均多少。</p>
+<div class="chartbox"><canvas id="cum"></canvas></div>
+<div class="chartbox" style="margin-top:18px;height:220px"><canvas id="excess"></canvas></div></section>
+
+<section id="stocksec"><h2>單一股票:模型分數 vs 實際表現</h2>
+<p class="hint">藍線是模型當時給的分數,橘線是之後 <span class="H"></span> 天實際表現的排名(百分位)。兩條線同時在 50% 以上或以下,代表那次方向猜對。</p>
+<select id="sel"></select> <span id="hit" class="k"></span>
+<div class="chartbox"><canvas id="stock"></canvas></div></section>
+</main>
+<script>
+const D = __DATA__;
+const HAS_CHART = typeof Chart !== 'undefined';
+const mk = (id, cfg) => HAS_CHART ? new Chart(document.getElementById(id), cfg) : null;
+const pct = v => v == null ? '–' : (v * 100).toFixed(0) + '%';
+const sret = v => v == null ? '–' : (v > 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
+const cls = v => v == null ? '' : (v > 0 ? 'up' : (v < 0 ? 'down' : ''));
+const fx = (v, d) => v == null ? '–' : v.toFixed(d);
+document.querySelectorAll('.H').forEach(e => e.textContent = D.horizon);
+document.querySelectorAll('.N').forEach(e => e.textContent = D.topn);
+document.getElementById('meta').textContent =
+  `資料日期 ${D.date}・共 ${D.n} 檔・網站更新於 ${D.generated}(台灣時間)`;
+
+const ic = Object.fromEntries(D.ic.map(r => [r.model, r]));
+const sm = Object.fromEntries(D.summary.map(r => [r.name, r]));
+const E = sm['綜合分數'], A = sm['全部股票平均'];
+document.getElementById('cards').innerHTML = [
+  ['Rank IC(綜合分數)', fx(ic['綜合分數'].ric, 3), '大於 0.03 才算有參考價值'],
+  ['Rank IC(產業中立)', fx(ic['產業/beta 中立'].ric, 3), '扣掉產業和 beta 後的選股能力'],
+  ['回測勝率', pct(E.win), '前 ' + D.topn + ' 檔贏過全部平均的期數比例'],
+  ['回測年化報酬', sret(E.ann), '全部平均 ' + sret(A.ann) + '(模型已扣成本)'],
+  ['每日紀錄勝率', D.live_win == null ? '累積中' : pct(D.live_win), D.live_n + ' 筆已有實際結果'],
+].map(c => `<div class="card"><div class="k">${c[0]}</div><div class="v">${c[1]}</div><div class="s">${c[2]}</div></div>`).join('');
+
+document.getElementById('watch').innerHTML = D.today.filter(r => r.watch).sort((a, b) => a.rank - b.rank).map(r =>
+  `<div class="card"><div class="k">${r.code}・${r.ind}</div><div class="v" style="font-size:20px">${r.name}</div>
+   <div class="s" style="margin-top:8px">短期 <span class="bar" style="width:${(r.score || 0) * 80}px"></span>${pct(r.score)}(第 ${r.rank} / ${D.n})</div>
+   <div class="s">長期 <span class="bar" style="width:${(r.long || 0) * 80}px;background:#7F77DD"></span>${pct(r.long)}</div>
+   <div class="s">產業中立 ${pct(r.neutral)}・收盤 ${r.close ?? '–'}・近20日 <span class="${cls(r.ret20)}">${sret(r.ret20)}</span></div>
+   <div class="s">營收年增 <span class="${cls(r.rev)}">${sret(r.rev)}</span>・本益比 ${r.pe ?? '–'}</div></div>`).join('');
+
+const inds = [...new Set(D.today.map(r => r.ind))];
+document.getElementById('ind').innerHTML = '<option value="">全部產業</option>' + inds.map(i => `<option>${i}</option>`).join('');
+const cols = [['rank', '排名'], ['code', '代號', 'l'], ['name', '名稱', 'l'], ['ind', '產業', 'l'],
+  ['score', '短期分數'], ['neutral', '產業中立'], ['long', '長期(1年)'], ['rev', '營收年增'],
+  ['pe', '本益比'], ['foreign', '外資20日'], ['ret20', '近20日'], ['close', '收盤價']];
+let sortKey = 'rank', asc = true;
+function drawRank() {
+  const q = document.getElementById('q').value.trim(), ind = document.getElementById('ind').value;
+  let rows = D.today.filter(r => (!q || r.code.includes(q) || r.name.includes(q)) && (!ind || r.ind === ind));
+  rows.sort((a, b) => { const x = a[sortKey], y = b[sortKey];
+    if (x == null) return 1; if (y == null) return -1; return (x > y ? 1 : x < y ? -1 : 0) * (asc ? 1 : -1); });
+  const t = document.getElementById('rank');
+  t.innerHTML = '<tr>' + cols.map(c => `<th class="${c[2] || ''}" data-k="${c[0]}">${c[1]}${sortKey === c[0] ? (asc ? ' ▲' : ' ▼') : ''}</th>`).join('') + '</tr>' +
+    rows.map(r => `<tr class="${r.watch ? 'watch' : ''}"><td>${r.rank}</td><td class="l">${r.code}</td><td class="l">${r.name}</td><td class="l">${r.ind}</td>
+    <td><span class="bar" style="width:${(r.score || 0) * 50}px"></span>${pct(r.score)}</td><td>${pct(r.neutral)}</td><td>${pct(r.long)}</td>
+    <td class="${cls(r.rev)}">${sret(r.rev)}</td><td>${r.pe ?? '–'}</td><td class="${cls(r.foreign)}">${r.foreign == null ? '–' : (r.foreign * 100).toFixed(1) + '%'}</td>
+    <td class="${cls(r.ret20)}">${sret(r.ret20)}</td><td>${r.close ?? '–'}</td></tr>`).join('');
+  t.querySelectorAll('th').forEach(th => th.onclick = () => { const k = th.dataset.k;
+    if (sortKey === k) asc = !asc; else { sortKey = k; asc = ['rank', 'code', 'name', 'ind'].includes(k); } drawRank(); });
+}
+document.getElementById('q').oninput = drawRank;
+document.getElementById('ind').onchange = drawRank;
+drawRank();
+
+document.getElementById('live').innerHTML =
+  '<tr><th class="l">預測日期</th><th>前 ' + D.topn + ' 檔實際報酬</th><th>全部平均</th><th>差距</th><th class="l">結果</th></tr>' +
+  D.live.map(r => r.diff == null
+    ? `<tr><td class="l">${r.date}</td><td class="pending" colspan="3">等待結果中</td><td class="l pending">還差 ${r.left} 個交易日</td></tr>`
+    : `<tr><td class="l">${r.date}</td><td class="${cls(r.top)}">${sret(r.top)}</td><td class="${cls(r.all)}">${sret(r.all)}</td>
+       <td class="${cls(r.diff)}">${sret(r.diff)}</td><td class="l">${r.diff > 0 ? '✔ 贏過平均' : '✘ 輸給平均'}</td></tr>`).join('');
+
+// 健康度
+const q = D.quint, y = D.yearly;
+const ups = q.slice(1).filter((v, i) => v != null && q[i] != null && v > q[i]).length;
+const yrWin = y.model.filter((v, i) => v != null && y.all[i] != null && v > y.all[i]).length;
+const checks = [
+  ['① Rank IC > 0.03', (ic['綜合分數'].ric || 0) > 0.03, '綜合分數 ' + fx(ic['綜合分數'].ric, 3)],
+  ['② 五分組遞增', ups >= 3 && q[4] > q[0], `相鄰組遞增 ${ups} / 4 次,第 5 組 ${sret(q[4])} vs 第 1 組 ${sret(q[0])}`],
+  ['③ 多數年份贏過平均', yrWin > y.years.length / 2, `${yrWin} / ${y.years.length} 年`],
+  ['④ Sharpe 高於全部平均', (E.sharpe || 0) > (A.sharpe || 0), `模型 ${fx(E.sharpe, 2)} vs 全部平均 ${fx(A.sharpe, 2)}`],
+];
+document.getElementById('checks').innerHTML = checks.map(c =>
+  `<div class="card"><div class="k">${c[0]}</div><div class="v ${c[1] ? 'good' : 'bad'}" style="font-size:19px">${c[1] ? '✔ 通過' : '✘ 未通過'}</div><div class="s">${c[2]}</div></div>`).join('');
+document.getElementById('ictab').innerHTML = '<tr><th class="l">模型(短期)</th><th>Rank IC</th><th>ICIR</th><th>IC&gt;0 比例</th></tr>' +
+  D.ic.map(r => `<tr><td class="l">${r.model}</td><td>${fx(r.ric, 4)}</td><td>${fx(r.icir, 3)}</td><td>${pct(r.pos)}</td></tr>`).join('');
+if (D.long_ic) document.getElementById('longic').innerHTML = '<h3>長期模型(1 年)Rank IC</h3><p class="hint">長期驗證期數少,可信度比短期低。</p><table>' +
+  '<tr><th class="l">模型(長期)</th><th>Rank IC</th><th>IC&gt;0 比例</th></tr>' +
+  D.long_ic.map(r => `<tr><td class="l">${r.model}</td><td>${fx(r.ric, 4)}</td><td>${pct(r.pos)}</td></tr>`).join('') + '</table>';
+document.getElementById('sumtab').innerHTML = '<tr><th class="l">策略</th><th>年化報酬</th><th>年化波動</th><th>Sharpe</th><th>勝率</th></tr>' +
+  D.summary.map(r => `<tr><td class="l">${r.name}</td><td class="${cls(r.ann)}">${sret(r.ann)}</td><td>${pct(r.vol)}</td><td>${fx(r.sharpe, 2)}</td><td>${r.name === '全部股票平均' ? '–' : pct(r.win)}</td></tr>`).join('');
+const yfmt = { ticks: { callback: v => (v * 100).toFixed(0) + '%' } };
+mk('quint', { type: 'bar',
+  data: { labels: ['1(最不看好)', '2', '3', '4', '5(最看好)'], datasets: [{ data: q, backgroundColor: '#378ADD' }] },
+  options: { maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => sret(c.raw) } } }, scales: { y: yfmt } } });
+mk('yearly', { type: 'bar',
+  data: { labels: y.years, datasets: [
+    { label: '綜合分數', data: y.model, backgroundColor: '#378ADD' },
+    { label: '產業中立', data: y.neutral, backgroundColor: '#7F77DD' },
+    { label: '全部平均', data: y.all, backgroundColor: '#B4B2A9' }] },
+  options: { maintainAspectRatio: false, plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ' ' + sret(c.raw) } } }, scales: { y: yfmt } } });
+if (D.importance) mk('imp', { type: 'bar',
+  data: { labels: D.importance.names, datasets: [{ data: D.importance.values, backgroundColor: '#1D9E75' }] },
+  options: { indexAxis: 'y', maintainAspectRatio: false, plugins: { legend: { display: false } } } });
+
+const B = D.bt;
+mk('cum', { type: 'line',
+  data: { labels: B.dates, datasets: [
+    { label: '綜合分數(前 ' + D.topn + ' 檔)', data: B.ens, borderColor: '#378ADD', pointRadius: 0, borderWidth: 2 },
+    { label: '產業/beta 中立', data: B.neutral, borderColor: '#7F77DD', pointRadius: 0, borderWidth: 1.5 },
+    { label: '全部股票平均', data: B.all, borderColor: '#888780', pointRadius: 0, borderWidth: 1.5 },
+    { label: '加權指數', data: B.market, borderColor: '#EF9F27', pointRadius: 0, borderWidth: 1.5 }] },
+  options: { maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, scales: { y: { title: { display: true, text: '累積淨值' } } } } });
+mk('excess', { type: 'bar',
+  data: { labels: B.dates, datasets: [{ data: B.excess, backgroundColor: B.excess.map(v => v > 0 ? '#E24B4A' : '#639922') }] },
+  options: { maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => sret(c.raw) } } }, scales: { y: yfmt } } });
+
+const sel = document.getElementById('sel');
+const order = D.today.map(r => r.code).filter(c => D.stocks[c]);
+Object.keys(D.stocks).forEach(c => { if (!order.includes(c)) order.push(c); });
+sel.innerHTML = order.map(c => `<option value="${c}">${c} ${D.stocks[c].name}</option>`).join('');
+let sc = null;
+function drawStock() {
+  const s = D.stocks[sel.value]; let n = 0, hit = 0;
+  s.score.forEach((v, i) => { const a = s.actual[i]; if (v != null && a != null) { n++; if ((v > 0.5) === (a > 0.5)) hit++; } });
+  document.getElementById('hit').textContent = n ? `方向猜對 ${hit} / ${n} 次(${(hit / n * 100).toFixed(0)}%)` : '';
+  if (sc) sc.destroy();
+  sc = mk('stock', { type: 'line',
+    data: { labels: s.dates, datasets: [
+      { label: '模型分數', data: s.score, borderColor: '#378ADD', pointRadius: 2, borderWidth: 1.5 },
+      { label: '實際表現排名', data: s.actual, borderColor: '#EF9F27', pointRadius: 2, borderWidth: 1.5 }] },
+    options: { maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+      plugins: { tooltip: { callbacks: { afterBody: it => '實際 ' + D.horizon + ' 日報酬:' + sret(s.ret[it[0].dataIndex]) } } },
+      scales: { y: { min: 0, max: 1, ticks: { callback: v => (v * 100) + '%' } } } } });
+}
+sel.onchange = drawStock;
+if (order.length) { sel.value = order.includes('2330') ? '2330' : order[0]; drawStock(); }
+</script></body></html>
