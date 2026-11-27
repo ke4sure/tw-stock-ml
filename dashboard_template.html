@@ -30,7 +30,7 @@ h2{font-size:15px;font-weight:600;margin:22px 0 10px}
 h2:first-child{margin-top:0}
 .note{font-size:12.5px;color:var(--sub);margin:-4px 0 10px}
 .stock .name{font-size:17px;font-weight:600}
-.stock .row{display:flex;justify-content:space-between;font-size:12.5px;color:var(--sub);margin-top:6px}
+.stock .row{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:12.5px;color:var(--sub);margin-top:6px}
 .meter{height:6px;background:#e2e8f0;border-radius:3px;margin-top:8px;overflow:hidden}
 .meter i{display:block;height:100%;background:var(--accent);border-radius:3px}
 .rank{font-size:12px;font-weight:600;color:var(--accent)}
@@ -49,6 +49,7 @@ input,select{font:inherit;padding:8px 12px;border:1px solid var(--line);border-r
 .cbox{position:relative;height:280px}
 .list div{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line);font-size:13.5px}
 .list div:last-child{border:0}
+@media(min-width:900px){#watch{grid-template-columns:repeat(5,1fr)}}
 footer{text-align:center;font-size:12px;color:var(--sub);padding:10px 0 30px}
 </style></head><body>
 <header>
@@ -67,12 +68,10 @@ footer{text-align:center;font-size:12px;color:var(--sub);padding:10px 0 30px}
 <main>
  <section class="page on" id="p-home">
   <div class="grid g2" id="kpi"></div>
-  <h2>關注股票</h2>
+  <h2>今日前 10 名</h2>
   <div class="grid g2" id="watch"></div>
-  <div class="two">
-   <div><h2>短期最看好</h2><div class="card list" id="topS"></div></div>
-   <div><h2>長期最看好</h2><div class="card list" id="topL"></div></div>
-  </div>
+  <h2>長期最看好</h2>
+  <div class="card list" id="topL"></div>
  </section>
 
  <section class="page" id="p-rank">
@@ -163,7 +162,8 @@ $('kpi').innerHTML = [
   ['實盤紀錄', D.live_win == null ? '累積中' : pct(D.live_win), D.live_n + ' 筆已驗證'],
 ].map(c => `<div class="card"><div class="k">${c[0]}</div><div class="v">${c[1]}</div><div class="s">${c[2]}</div></div>`).join('');
 
-$('watch').innerHTML = D.today.filter(r => r.watch).sort((a, b) => a.rank - b.rank).map(r => `
+D.today.forEach(r => r.top10 = r.rank <= 10);
+$('watch').innerHTML = D.today.filter(r => r.top10).sort((a, b) => a.rank - b.rank).map(r => `
  <div class="card stock">
   <div style="display:flex;justify-content:space-between"><span class="k">${r.code} · ${r.ind}</span><span class="rank">#${r.rank}</span></div>
   <div class="name">${r.name}</div>
@@ -173,7 +173,6 @@ $('watch').innerHTML = D.today.filter(r => r.watch).sort((a, b) => a.rank - b.ra
  </div>`).join('');
 
 const li = rows => rows.map(r => `<div><span><span class="mut">${r.code}</span> ${r.name}</span><b>${pct(r._s)}</b></div>`).join('');
-$('topS').innerHTML = li([...D.today].sort((a, b) => a.rank - b.rank).slice(0, 10).map(r => ({ ...r, _s: r.score })));
 $('topL').innerHTML = li([...D.today].filter(r => r.long != null).sort((a, b) => b.long - a.long).slice(0, 10).map(r => ({ ...r, _s: r.long })));
 
 // 排名
@@ -186,7 +185,7 @@ function drawTbl() {
   const rows = D.today.filter(r => (!qq || r.code.includes(qq) || r.name.includes(qq)) && (!ind || r.ind === ind))
     .sort((a, b) => { const x = a[sk], z = b[sk]; if (x == null) return 1; if (z == null) return -1; return (x > z ? 1 : x < z ? -1 : 0) * (asc ? 1 : -1); });
   $('tbl').innerHTML = '<tr>' + cols.map(c => `<th class="${c[2] || ''}" data-k="${c[0]}">${c[1]}${sk === c[0] ? (asc ? ' ↑' : ' ↓') : ''}</th>`).join('') + '</tr>' +
-    rows.map(r => `<tr class="${r.watch ? 'w' : ''}"><td class="mut">${r.rank}</td><td class="l">${r.code}</td><td class="l"><b>${r.name}</b></td><td class="l mut">${r.ind}</td>
+    rows.map(r => `<tr class="${r.top10 ? 'w' : ''}"><td class="mut">${r.rank}</td><td class="l">${r.code}</td><td class="l"><b>${r.name}</b></td><td class="l mut">${r.ind}</td>
     <td>${bar(r.score)}${pct(r.score)}</td><td>${pct(r.neutral)}</td><td>${pct(r.long)}</td><td class="${cl(r.rev)}">${sr(r.rev)}</td>
     <td>${r.pe ?? '–'}</td><td class="${cl(r.foreign)}">${r.foreign == null ? '–' : (r.foreign * 100).toFixed(1) + '%'}</td>
     <td class="${cl(r.ret20)}">${sr(r.ret20)}</td><td>${r.close ?? '–'}</td></tr>`).join('');
