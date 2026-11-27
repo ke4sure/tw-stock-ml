@@ -2,7 +2,7 @@
 台股機器學習選股模型 v3
 - 價量(yfinance)+ 基本面 / 估值 / 籌碼(FinMind)
 - 短期(20 交易日)與長期(250 交易日)兩個模型
-- LightGBM + Ridge 綜合分數,另提供「產業與 beta 中立」版本
+- LightGBM + Ridge 綜合分數,再扣掉產業與 beta 影響 → 「產業中立分數」(網站主要分數)
 - 輸出網站到 docs/(GitHub Pages 會直接顯示)
 
 執行:python stock_model.py
@@ -524,6 +524,7 @@ def walk_forward(data, stock_feats, cfg):
         if k % 20 == 0:
             print(f"  [{cfg['name']}] {k + 1}/{len(steps)},{time.time() - t0:.0f} 秒")
     pred = add_scores(pd.concat(preds))
+    pred["neutral_r"] = pred.groupby("date")["neutral"].rank(pct=True)
     pred["reversal"] = 1 - pred["ret_20"].fillna(0.5)
     pred["fut_rank"] = pred.groupby("date")["fut"].rank(pct=True)
     return pred
@@ -542,7 +543,7 @@ def evaluate(pred, h, market):
                         "icir": ric.mean() / ric.std(), "pos": (ric > 0).mean()})
     reb_dates = np.sort(pred["date"].unique())[::h]
     reb = pred[pred["date"].isin(reb_dates)].copy()
-    reb["q"] = np.ceil(reb.groupby("date")["ens"].rank(pct=True) * 5).clip(1, 5).astype(int)
+    reb["q"] = np.ceil(reb.groupby("date")["neutral"].rank(pct=True) * 5).clip(1, 5).astype(int)
     quint = reb.groupby(["date", "q"])["fut"].mean().unstack().mean()
     mkt_fut = market.shift(-h) / market - 1
     rec = []
@@ -615,7 +616,7 @@ def build_site(close, data, stock_feats, short_pred, short_eval, long_eval, late
     reb = short_pred[short_pred["date"].isin(reb_dates)].sort_values("date")
     stocks_hist = {t: {"name": STOCKS.get(t, t),
                        "dates": [d.strftime("%Y-%m-%d") for d in g["date"]],
-                       "score": [_c(v, 3) for v in g["ens"]],
+                       "score": [_c(v, 3) for v in g["neutral_r"]],
                        "actual": [_c(v, 3) for v in g["fut_rank"]],
                        "ret": [_c(v) for v in g["fut"]]}
                    for t, g in reb.groupby("ticker")}
@@ -629,7 +630,7 @@ def build_site(close, data, stock_feats, short_pred, short_eval, long_eval, late
         "horizon": h, "topn": TOP_N, "n": len(latest),
         "today": [{
             "rank": int(r["rank"]), "code": r["ticker"], "name": r["name"], "ind": r["industry"],
-            "score": _c(r["ens_pct"], 3), "neutral": _c(r["neutral_pct"], 3),
+            "score": _c(r["neutral_pct"], 3), "ens": _c(r["ens_pct"], 3),
             "long": _c(r["long_pct"], 3), "ret20": _c(r["raw_ret_20"]),
             "rev": _c(r.get("raw_rev_yoy")), "pe": _c(1 / r["raw_earn_yield"], 1)
             if r.get("raw_earn_yield") not in (None, 0) and pd.notna(r.get("raw_earn_yield")) else None,
@@ -645,14 +646,14 @@ def build_site(close, data, stock_feats, short_pred, short_eval, long_eval, late
                      "sharpe": _c(ann[k] / vol[k], 2) if vol[k] else None,
                      "win": _c(win[k], 3)} for k in bt.columns],
         "yearly": {"years": [int(y) for y in yearly.index],
-                   "model": [_c(v) for v in yearly["綜合分數"]],
-                   "neutral": [_c(v) for v in yearly["產業/beta 中立"]],
+                   "model": [_c(v) for v in yearly["產業/beta 中立"]],
+                   "ens": [_c(v) for v in yearly["綜合分數"]],
                    "all": [_c(v) for v in yearly["全部股票平均"]]},
         "bt": {"dates": [d.strftime("%Y-%m-%d") for d in bt.index],
                **{k: [_c(v) for v in cum[name]] for k, name in
                   [("ens", "綜合分數"), ("neutral", "產業/beta 中立"),
                    ("all", "全部股票平均"), ("market", "加權指數")]},
-               "excess": [_c(v) for v in (bt["綜合分數"] - bt["全部股票平均"])]},
+               "excess": [_c(v) for v in (bt["產業/beta 中立"] - bt["全部股票平均"])]},
         "live": live,
         "live_win": _c(np.mean([r["diff"] > 0 for r in done])) if done else None,
         "live_n": len(done),
@@ -717,8 +718,8 @@ def main():
             latest["ens_pct"] = tmp["ens"].rank(pct=True).values
             latest["neutral_pct"] = tmp["neutral"].rank(pct=True).values
         else:
-            latest["long_pct"] = tmp["ens"].rank(pct=True).values
-    latest["rank"] = latest["ens_pct"].rank(ascending=False, method="first").astype(int)
+            latest["long_pct"] = tmp["neutral"].rank(pct=True).values
+    latest["rank"] = latest["neutral_pct"].rank(ascending=False, method="first").astype(int)
     latest["name"] = latest["ticker"].map(STOCKS)
     latest["close"] = latest["ticker"].map(close.loc[today])
     latest = latest.sort_values("rank")

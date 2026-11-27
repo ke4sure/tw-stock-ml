@@ -110,7 +110,7 @@ footer{text-align:center;font-size:12px;color:var(--sub);padding:10px 0 30px}
   <p class="note" style="margin-top:10px">藍:模型分數 · 橘:實際表現排名 · 同在 50% 同側即猜對</p>
  </section>
 </main>
-<footer>分數為未來相對其他股票的排名預測(100% 最看好),非股價預測 · 僅供學習研究,非投資建議</footer>
+<footer>分數為未來相對其他股票的排名預測(100% 最看好,已扣除產業與 beta 影響),非股價預測 · 僅供學習研究,非投資建議</footer>
 <script>
 const D = __DATA__;
 const HAS = typeof Chart !== 'undefined';
@@ -127,12 +127,13 @@ document.querySelectorAll('.N').forEach(e => e.textContent = D.topn);
 const ic = Object.fromEntries(D.ic.map(r => [r.model, r]));
 const lic = D.long_ic ? Object.fromEntries(D.long_ic.map(r => [r.model, r])) : {};
 const sm = Object.fromEntries(D.summary.map(r => [r.name, r]));
-const E = sm['綜合分數'], A = sm['全部股票平均'];
+const MAIN = '產業/beta 中立';
+const E = sm[MAIN], A = sm['全部股票平均'];
 const q = D.quint, y = D.yearly;
 const ups = q.slice(1).filter((v, i) => v != null && q[i] != null && v > q[i]).length;
 const yw = y.model.filter((v, i) => v != null && y.all[i] != null && v > y.all[i]).length;
 const checks = [
-  ['Rank IC > 0.03', (ic['綜合分數'].ric || 0) > 0.03, f(ic['綜合分數'].ric, 3)],
+  ['Rank IC > 0.03', (ic[MAIN].ric || 0) > 0.03, f(ic[MAIN].ric, 3)],
   ['五分組遞增', ups >= 3 && q[4] > q[0], `第5組 ${sr(q[4])} / 第1組 ${sr(q[0])}`],
   ['多數年份勝出', yw > y.years.length / 2, `${yw} / ${y.years.length} 年`],
   ['Sharpe 勝出', (E.sharpe || 0) > (A.sharpe || 0), `${f(E.sharpe, 2)} vs ${f(A.sharpe, 2)}`],
@@ -156,7 +157,7 @@ const yPct = { ticks: { callback: v => Math.round(v * 100) + '%' } };
 
 // 總覽
 $('kpi').innerHTML = [
-  ['Rank IC', f(ic['綜合分數'].ric, 3), '> 0.03 有參考價值'],
+  ['Rank IC', f(ic[MAIN].ric, 3), '> 0.03 有參考價值'],
   ['回測年化', sr(E.ann), '全部平均 ' + sr(A.ann)],
   ['勝率', pct(E.win), '贏過全部平均的期數'],
   ['實盤紀錄', D.live_win == null ? '累積中' : pct(D.live_win), D.live_n + ' 筆已驗證'],
@@ -177,7 +178,7 @@ $('topL').innerHTML = li([...D.today].filter(r => r.long != null).sort((a, b) =>
 
 // 排名
 $('ind').innerHTML = '<option value="">全部產業</option>' + [...new Set(D.today.map(r => r.ind))].map(i => `<option>${i}</option>`).join('');
-const cols = [['rank', '#'], ['code', '代號', 'l'], ['name', '名稱', 'l'], ['ind', '產業', 'l'], ['score', '短期'], ['neutral', '產業中立'],
+const cols = [['rank', '#'], ['code', '代號', 'l'], ['name', '名稱', 'l'], ['ind', '產業', 'l'], ['score', '短期'], ['ens', '未中立'],
   ['long', '長期'], ['rev', '營收年增'], ['pe', '本益比'], ['foreign', '外資20日'], ['ret20', '20日漲跌'], ['close', '收盤']];
 let sk = 'rank', asc = true;
 function drawTbl() {
@@ -186,7 +187,7 @@ function drawTbl() {
     .sort((a, b) => { const x = a[sk], z = b[sk]; if (x == null) return 1; if (z == null) return -1; return (x > z ? 1 : x < z ? -1 : 0) * (asc ? 1 : -1); });
   $('tbl').innerHTML = '<tr>' + cols.map(c => `<th class="${c[2] || ''}" data-k="${c[0]}">${c[1]}${sk === c[0] ? (asc ? ' ↑' : ' ↓') : ''}</th>`).join('') + '</tr>' +
     rows.map(r => `<tr class="${r.top10 ? 'w' : ''}"><td class="mut">${r.rank}</td><td class="l">${r.code}</td><td class="l"><b>${r.name}</b></td><td class="l mut">${r.ind}</td>
-    <td>${bar(r.score)}${pct(r.score)}</td><td>${pct(r.neutral)}</td><td>${pct(r.long)}</td><td class="${cl(r.rev)}">${sr(r.rev)}</td>
+    <td>${bar(r.score)}${pct(r.score)}</td><td class="mut">${pct(r.ens)}</td><td>${pct(r.long)}</td><td class="${cl(r.rev)}">${sr(r.rev)}</td>
     <td>${r.pe ?? '–'}</td><td class="${cl(r.foreign)}">${r.foreign == null ? '–' : (r.foreign * 100).toFixed(1) + '%'}</td>
     <td class="${cl(r.ret20)}">${sr(r.ret20)}</td><td>${r.close ?? '–'}</td></tr>`).join('');
   $('tbl').querySelectorAll('th').forEach(th => th.onclick = () => { const k = th.dataset.k;
@@ -223,8 +224,8 @@ const DRAW = {
   live() {
     const B = D.bt;
     mk('cum', { type: 'line', data: { labels: B.dates, datasets: [
-      { label: '綜合分數', data: B.ens, borderColor: '#2563eb', borderWidth: 2, pointRadius: 0 },
-      { label: '產業中立', data: B.neutral, borderColor: '#7c3aed', borderWidth: 1.5, pointRadius: 0 },
+      { label: '產業中立(主要)', data: B.neutral, borderColor: '#2563eb', borderWidth: 2, pointRadius: 0 },
+      { label: '未中立', data: B.ens, borderColor: '#a78bfa', borderWidth: 1.5, pointRadius: 0 },
       { label: '全部平均', data: B.all, borderColor: '#94a3b8', borderWidth: 1.5, pointRadius: 0 },
       { label: '加權指數', data: B.market, borderColor: '#f59e0b', borderWidth: 1.5, pointRadius: 0 }] },
       options: { maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } } } });
@@ -235,8 +236,8 @@ const DRAW = {
     mk('quint', { type: 'bar', data: { labels: ['1 最不看好', '2', '3', '4', '5 最看好'], datasets: [{ data: q, backgroundColor: ['#cbd5e1', '#cbd5e1', '#93c5fd', '#60a5fa', '#2563eb'], borderRadius: 6 }] },
       options: { maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => sr(c.raw) } } }, scales: { y: yPct } } });
     mk('yearly', { type: 'bar', data: { labels: y.years, datasets: [
-      { label: '綜合分數', data: y.model, backgroundColor: '#2563eb', borderRadius: 4 },
-      { label: '產業中立', data: y.neutral, backgroundColor: '#a78bfa', borderRadius: 4 },
+      { label: '產業中立', data: y.model, backgroundColor: '#2563eb', borderRadius: 4 },
+      { label: '未中立', data: y.ens, backgroundColor: '#a78bfa', borderRadius: 4 },
       { label: '全部平均', data: y.all, backgroundColor: '#cbd5e1', borderRadius: 4 }] },
       options: { maintainAspectRatio: false, plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } }, tooltip: { callbacks: { label: c => c.dataset.label + ' ' + sr(c.raw) } } }, scales: { y: yPct } } });
     if (D.importance) mk('imp', { type: 'bar', data: { labels: D.importance.names.map(n => ZH[n] || n), datasets: [{ data: D.importance.values, backgroundColor: '#0ea5e9', borderRadius: 4 }] },
