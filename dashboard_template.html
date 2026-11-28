@@ -70,8 +70,10 @@ footer{text-align:center;font-size:12px;color:var(--sub);padding:10px 0 30px}
   <div class="grid g2" id="kpi"></div>
   <h2>今日前 10 名</h2>
   <div class="grid g2" id="watch"></div>
-  <h2>長期最看好</h2>
-  <div class="card list" id="topL"></div>
+  <div class="two">
+   <div><h2>長期最看好</h2><div class="card list" id="topL"></div></div>
+   <div><h2>防守型前 10 <span class="k">(現金多、負債低、現金流穩)</span></h2><div class="card list" id="topD"></div></div>
+  </div>
  </section>
 
  <section class="page" id="p-rank">
@@ -178,12 +180,14 @@ $('watch').innerHTML = D.today.filter(r => r.top10).sort((a, b) => a.rank - b.ra
  </div>`).join('');
 
 const li = rows => rows.map(r => `<div><span><span class="mut">${r.code}</span> ${r.name}</span><b>${pct(r._s)}</b></div>`).join('');
+$('topD').innerHTML = [...D.today].filter(r => r.def != null).sort((a, b) => b.def - a.def).slice(0, 10)
+  .map(r => `<div><span><span class="mut">${r.code}</span> ${r.name}</span><span class="s">FCF殖利率 ${sr(r.fcfy)} · 負債 ${pct(r.debt)} <b style="color:var(--ink);margin-left:6px">${pct(r.def)}</b></span></div>`).join('') || '<div class="s">資料不足</div>';
 $('topL').innerHTML = li([...D.today].filter(r => r.long != null).sort((a, b) => b.long - a.long).slice(0, 10).map(r => ({ ...r, _s: r.long })));
 
 // 排名
 $('ind').innerHTML = '<option value="">全部產業</option>' + [...new Set(D.today.map(r => r.ind))].map(i => `<option>${i}</option>`).join('');
 const cols = [['rank', '#'], ['chg', '變化'], ['code', '代號', 'l'], ['name', '名稱', 'l'], ['ind', '產業', 'l'], ['score', '短期'], ['raw', '今日單日'],
-  ['long', '長期'], ['rev', '營收年增'], ['pe', '本益比'], ['foreign', '外資20日'], ['ret20', '20日漲跌'], ['close', '收盤']];
+  ['long', '長期'], ['def', '防守'], ['fcfy', 'FCF殖利率'], ['debt', '負債比'], ['rev', '營收年增'], ['pe', '本益比'], ['foreign', '外資20日'], ['ret20', '20日漲跌'], ['close', '收盤']];
 let sk = 'rank', asc = true;
 function drawTbl() {
   const qq = $('q').value.trim(), ind = $('ind').value;
@@ -191,7 +195,7 @@ function drawTbl() {
     .sort((a, b) => { const x = a[sk], z = b[sk]; if (x == null) return 1; if (z == null) return -1; return (x > z ? 1 : x < z ? -1 : 0) * (asc ? 1 : -1); });
   $('tbl').innerHTML = '<tr>' + cols.map(c => `<th class="${c[2] || ''}" data-k="${c[0]}">${c[1]}${sk === c[0] ? (asc ? ' ↑' : ' ↓') : ''}</th>`).join('') + '</tr>' +
     rows.map(r => `<tr class="${r.top10 ? 'w' : ''}"><td class="mut">${r.rank}</td><td>${chg(r.chg)}</td><td class="l">${r.code}</td><td class="l"><b>${r.name}</b></td><td class="l mut">${r.ind}</td>
-    <td>${bar(r.score)}${pct(r.score)}</td><td class="mut">${pct(r.raw)}</td><td>${pct(r.long)}</td><td class="${cl(r.rev)}">${sr(r.rev)}</td>
+    <td>${bar(r.score)}${pct(r.score)}</td><td class="mut">${pct(r.raw)}</td><td>${pct(r.long)}</td><td>${pct(r.def)}</td><td class="${cl(r.fcfy)}">${sr(r.fcfy)}</td><td>${pct(r.debt)}</td><td class="${cl(r.rev)}">${sr(r.rev)}</td>
     <td>${r.pe ?? '–'}</td><td class="${cl(r.foreign)}">${r.foreign == null ? '–' : (r.foreign * 100).toFixed(1) + '%'}</td>
     <td class="${cl(r.ret20)}">${sr(r.ret20)}</td><td>${r.close ?? '–'}</td></tr>`).join('');
   $('tbl').querySelectorAll('th').forEach(th => th.onclick = () => { const k = th.dataset.k;
@@ -230,7 +234,9 @@ const ZH = { ret_1: '1日報酬', ret_5: '5日報酬', ret_20: '20日報酬', re
   rev_yoy: '營收年增', rev_yoy_3m: '3月營收年增', rev_mom: '營收月增', rev_vs_high: '營收距高點', rev_yoy_accel: '營收加速',
   eps_yoy: 'EPS年增', gross_margin: '毛利率', gm_chg_yoy: '毛利率變化', op_margin: '營益率', om_chg_yoy: '營益率變化',
   mkt_ret_5: '大盤5日', mkt_ret_20: '大盤20日', mkt_gap_ma60: '大盤季線乖離', mkt_vol_20: '大盤波動', sox_ret_5: '費半5日',
-  sox_ret_20: '費半20日', fx_ret_20: '匯率20日' };
+  sox_ret_20: '費半20日', fx_ret_20: '匯率20日', fcf_yield: '自由現金流殖利率', ocf_yield: '營業現金流殖利率',
+  ocf_to_assets: '營業現金流/資產', accruals: '應計項目', cash_to_assets: '現金/資產', debt_ratio: '負債比',
+  current_ratio: '流動比', fcf_pos_8q: '現金流穩定度' };
 
 const DRAW = {
   live() {

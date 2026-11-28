@@ -192,6 +192,8 @@ FM_DATASETS = {
     "TaiwanStockInstitutionalInvestorsBuySell": (12, 10, ["date"], _tf_inst),
     "TaiwanStockMonthRevenue": (24 * 5, 70, ["revenue_year", "revenue_month"], None),
     "TaiwanStockFinancialStatements": (24 * 7, 200, ["date", "type"], None),
+    "TaiwanStockCashFlowsStatement": (24 * 7, 200, ["date", "type"], None),
+    "TaiwanStockBalanceSheet": (24 * 7, 200, ["date", "type"], None),
 }
 
 
@@ -308,6 +310,49 @@ def fundamental_events(codes):
             out.append(f.dropna(how="all", subset=["eps_yoy", "gross_margin", "op_margin"]))
         if out:
             events.append(pd.concat(out))
+    # 現金流量表(年初累計 → 單季 → 近四季)+ 資產負債表(季底餘額),公布時間同財報
+    cf = read_fm("TaiwanStockCashFlowsStatement", codes)
+    bs = read_fm("TaiwanStockBalanceSheet", codes)
+    if not cf.empty and not bs.empty and {"type", "value"} <= set(cf.columns) & set(bs.columns):
+        for d in (cf, bs):
+            d["date"] = pd.to_datetime(d["date"])
+            d["value"] = pd.to_numeric(d["value"], errors="coerce")
+        cf_types = ["CashFlowsFromOperatingActivities", "PropertyAndPlantAndEquipment", "NetIncomeBeforeTax"]
+        bs_types = ["TotalAssets", "Liabilities", "CashAndCashEquivalents", "CurrentAssets",
+                    "CurrentLiabilities", "OrdinaryShare"]
+        bs_by = dict(tuple(bs[bs["type"].isin(bs_types)].groupby("ticker")))
+        out = []
+        for t, g in cf[cf["type"].isin(cf_types)].groupby("ticker"):
+            if t not in bs_by:
+                continue
+            p = g.pivot_table(index="date", columns="type", values="value", aggfunc="last").sort_index()
+            qr = pd.date_range(p.index.min(), p.index.max(), freq=QFREQ)
+            p = p.reindex(qr)
+            q = p - p.shift(1)                      # 單季 = 本季累計 - 上季累計
+            q[p.index.month == 3] = p[p.index.month == 3]  # Q1 本身就是單季
+            col = lambda df, k: df[k] if k in df.columns else pd.Series(np.nan, index=df.index)  # noqa: E731
+            ocf_q = col(q, "CashFlowsFromOperatingActivities")
+            fcf_q = ocf_q + col(q, "PropertyAndPlantAndEquipment").fillna(0)  # 資本支出為負數
+            ni_q = col(q, "NetIncomeBeforeTax")
+            b = bs_by[t].pivot_table(index="date", columns="type", values="value", aggfunc="last").reindex(qr)
+            assets = col(b, "TotalAssets").replace(0, np.nan)
+            ocf_ttm, fcf_ttm = ocf_q.rolling(4).sum(), fcf_q.rolling(4).sum()
+            f = pd.DataFrame({
+                "ocf_ttm": ocf_ttm, "fcf_ttm": fcf_ttm,
+                "shares": col(b, "OrdinaryShare") / 10,          # 面額 10 元
+                "ocf_to_assets": ocf_ttm / assets,
+                "accruals": (ni_q.rolling(4).sum() - ocf_ttm) / assets,   # 越低 = 獲利越有現金支撐
+                "cash_to_assets": col(b, "CashAndCashEquivalents") / assets,
+                "debt_ratio": col(b, "Liabilities") / assets,
+                "current_ratio": col(b, "CurrentAssets") / col(b, "CurrentLiabilities").replace(0, np.nan),
+                "fcf_pos_8q": (fcf_q > 0).astype(float).where(fcf_q.notna()).rolling(8, min_periods=4).mean(),
+            }, index=qr)
+            lag = np.where(f.index.month == 12, 90, 45)
+            f["avail"] = f.index + pd.to_timedelta(lag, unit="D")
+            f["ticker"] = t
+            out.append(f.dropna(subset=["ocf_to_assets", "debt_ratio"], how="all"))
+        if out:
+            events.append(pd.concat(out))
     return events
 
 
@@ -377,6 +422,21 @@ MKT_FEATS = ["mkt_ret_5", "mkt_ret_20", "mkt_gap_ma60", "mkt_vol_20",
              "sox_ret_5", "sox_ret_20", "fx_ret_20"]
 
 
+# 防守分數:現金多、負債低、自由現金流穩定、波動小、配息高(金融股與 ETF 財報結構不同,不計算)
+DEFENSIVE = {"fcf_yield": 1, "cash_to_assets": 1, "debt_ratio": -1, "fcf_pos_8q": 1,
+             "current_ratio": 1, "vol_60": -1, "beta_60": -1, "div_yield": 1}
+
+
+def defensive_score(data):
+    parts = [(data[k] if w > 0 else 1 - data[k]) for k, w in DEFENSIVE.items() if k in data]
+    if not parts:
+        return np.nan
+    raw = pd.concat(parts, axis=1).mean(axis=1, skipna=True)
+    n_ok = pd.concat(parts, axis=1).notna().sum(axis=1)
+    raw[(n_ok < len(parts) * 0.6) | data["industry"].isin(["金融", "ETF"])] = np.nan
+    return raw.groupby(data["date"]).rank(pct=True)
+
+
 def build_panel(close, volume, market, sox_raw, fx_raw):
     sox, fx = lag_to_tw(sox_raw, close.index), lag_to_tw(fx_raw, close.index)
     mret = pct(market)
@@ -408,6 +468,7 @@ def build_panel(close, volume, market, sox_raw, fx_raw):
         df["skew_60"] = r.rolling(60).skew()
         df["beta_60"] = r.rolling(60).cov(mret) / mret.rolling(60).var()
         df["log_dollar_vol"] = np.log(dollar.rolling(20).mean() + 1)
+        df["raw_close"] = c
         df["volu_ratio"] = v.rolling(5).mean() / v.rolling(60).mean()
         df["amihud"] = (r.abs() / dollar.replace(0, np.nan)).rolling(20).mean()
         if t in fm_daily:
@@ -432,8 +493,19 @@ def build_panel(close, volume, market, sox_raw, fx_raw):
                              on="date", by="ticker", direction="backward",
                              tolerance=pd.Timedelta(days=200))
 
+    # 現金流殖利率 = 近四季現金流 / 市值(用當天收盤價)
+    if {"fcf_ttm", "shares"} <= set(data.columns):
+        mcap = data["raw_close"] * data["shares"]
+        data["fcf_yield"] = data["fcf_ttm"] / mcap
+        data["ocf_yield"] = data["ocf_ttm"] / mcap
+    data = data.drop(columns=[c for c in ["fcf_ttm", "ocf_ttm", "shares"] if c in data.columns])
+    for k in ["fcf_yield", "debt_ratio", "cash_to_assets"]:
+        if k in data:
+            data["raw_" + k] = data[k]
+
     fut_cols = [c for c in data.columns if c.startswith("fut_")]
-    stock_feats = [c for c in data.columns if c not in ["date", "ticker"] + fut_cols]
+    stock_feats = [c for c in data.columns if c not in ["date", "ticker", "raw_close"] + fut_cols
+                   and not c.startswith("raw_")]
     # 全部缺值的欄位(例如 FinMind 沒抓到)就不用
     stock_feats = [c for c in stock_feats if data[c].notna().mean() > 0.05]
 
@@ -449,6 +521,7 @@ def build_panel(close, volume, market, sox_raw, fx_raw):
     for h in (SHORT["horizon"], LONG["horizon"]):
         data[f"target_{h}"] = data.groupby("date")[f"fut_{h}"].rank(pct=True)
     data["industry"] = data["ticker"].map(INDUSTRY_OF)
+    data["defensive"] = defensive_score(data)
     return data.sort_values(["date", "ticker"]).reset_index(drop=True), stock_feats
 
 
@@ -540,7 +613,7 @@ def smooth_scores(df, col="neutral_r", days=SMOOTH_DAYS):
     return df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
 
-KEEP = ["date", "ticker", "industry", "beta_60", "log_dollar_vol", "ret_20"]
+KEEP = ["date", "ticker", "industry", "beta_60", "log_dollar_vol", "ret_20", "defensive"]
 
 
 def walk_forward(data, stock_feats, cfg):
@@ -578,6 +651,7 @@ def score_names():
              "gbm": GBM_NAME, "ridge": "Ridge 線性"}
     if make_ranker is not None:
         names["rank"] = "LambdaRank 排序"
+    names["defensive"] = "防守分數(規則型)"
     names["reversal"] = "跌深反彈(基準)"
     return names
 
@@ -740,6 +814,8 @@ def build_site(close, short_pred, short_eval, long_eval, latest, importance):
             "chg": (int(prev_rank[r["ticker"]]) - int(r["rank"])) if r["ticker"] in prev_rank else None,
             "ret20": _c(r["raw_ret_20"]), "rev": _c(r.get("raw_rev_yoy")), "pe": pe(r),
             "foreign": _c(r.get("raw_foreign_20")), "close": _c(r["close"], 2),
+            "def": _c(r.get("defensive"), 3), "fcfy": _c(r.get("raw_fcf_yield")),
+            "debt": _c(r.get("raw_debt_ratio"), 3), "cash": _c(r.get("raw_cash_to_assets"), 3),
         } for _, r in latest.iterrows()],
         "ic": [{"model": r["model"], "ric": _c(r["ric"]), "icir": _c(r["icir"], 3),
                 "pos": _c(r["pos"], 3)} for _, r in ic.iterrows()],
@@ -834,7 +910,8 @@ def main():
     latest["name"] = latest["ticker"].map(STOCKS)
     latest["close"] = latest["ticker"].map(close.loc[today])
     latest = latest.sort_values("rank")
-    for k in ["raw_rev_yoy", "raw_earn_yield", "raw_foreign_20"]:
+    for k in ["raw_rev_yoy", "raw_earn_yield", "raw_foreign_20", "raw_fcf_yield",
+              "raw_debt_ratio", "raw_cash_to_assets", "defensive"]:
         if k not in latest:
             latest[k] = np.nan
     build_site(close, short_pred, short_eval, long_eval, latest, importance)
