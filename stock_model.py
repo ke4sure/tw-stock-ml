@@ -1,8 +1,9 @@
 """
-台股機器學習選股模型 v3
+台股機器學習選股模型 v4
 - 價量(yfinance)+ 基本面 / 估值 / 籌碼(FinMind)
 - 短期(20 交易日)與長期(250 交易日)兩個模型
-- LightGBM + Ridge 綜合分數,再扣掉產業與 beta 影響 → 「產業中立分數」(網站主要分數)
+- LightGBM 迴歸 + Ridge + LambdaRank 排序 → 扣掉產業 / beta / 規模影響 → 5 日平滑 = 主要分數
+- 回測模擬實際持股(換股緩衝、依實際換手算成本),並用 bootstrap / PSR 估計結果的可信度
 - 輸出網站到 docs/(GitHub Pages 會直接顯示)
 
 執行:python stock_model.py
@@ -456,14 +457,22 @@ def build_panel(close, volume, market, sox_raw, fx_raw):
 # ============================================================
 from sklearn.linear_model import Ridge  # noqa: E402
 
+SMOOTH_DAYS = 5      # 分數平滑:取最近幾個交易日的平均(降低每天排名大跳動)
+BUFFER_MULT = 2      # 換股緩衝:持股只要還在前 TOP_N × 2 名就續抱
+
 try:
-    from lightgbm import LGBMRegressor
+    from lightgbm import LGBMRanker, LGBMRegressor
+
+    _LGB_COMMON = dict(n_estimators=200, learning_rate=0.05, num_leaves=31,
+                       min_child_samples=200, subsample=0.8, subsample_freq=1,
+                       colsample_bytree=0.8, reg_lambda=1.0, verbose=-1,
+                       random_state=42, n_jobs=-1, deterministic=True, force_row_wise=True)
 
     def make_gbm():
-        return LGBMRegressor(n_estimators=200, learning_rate=0.05, num_leaves=31,
-                             min_child_samples=200, subsample=0.8, subsample_freq=1,
-                             colsample_bytree=0.8, reg_lambda=1.0, verbose=-1,
-                             random_state=42, n_jobs=-1)
+        return LGBMRegressor(**_LGB_COMMON)
+
+    def make_ranker():
+        return LGBMRanker(objective="lambdarank", **_LGB_COMMON)
     GBM_NAME = "LightGBM"
 except ImportError:
     from sklearn.ensemble import HistGradientBoostingRegressor
@@ -472,35 +481,66 @@ except ImportError:
         return HistGradientBoostingRegressor(max_iter=200, learning_rate=0.05,
                                              max_leaf_nodes=31, min_samples_leaf=200,
                                              random_state=42)
+    make_ranker = None
     GBM_NAME = "HistGradientBoosting"
 
 
-def fit_predict(tr, te, stock_feats, h):
+def fit_models(tr, stock_feats, h):
+    """訓練三個模型:LightGBM 迴歸、Ridge 線性、LambdaRank 排序(直接學「誰排前面」)"""
     feats = stock_feats + MKT_FEATS
     y = tr[f"target_{h}"]
-    gbm = make_gbm().fit(tr[feats], y)
-    ridge = Ridge(alpha=10.0).fit(tr[stock_feats].fillna(0.5), y)
-    return gbm.predict(te[feats]), ridge.predict(te[stock_feats].fillna(0.5)), gbm
+    models = {"feats": feats, "stock_feats": stock_feats,
+              "gbm": make_gbm().fit(tr[feats], y),
+              "ridge": Ridge(alpha=10.0).fit(tr[stock_feats].fillna(0.5), y)}
+    if make_ranker is not None:
+        trs = tr.sort_values(["date", "ticker"])
+        rel = np.minimum((trs[f"target_{h}"] * 5).astype(int), 4)  # 0~4 五個等級
+        groups = trs.groupby("date", sort=True).size().values
+        models["rank"] = make_ranker().fit(trs[feats], rel, group=groups)
+    return models
+
+
+def predict_models(models, df):
+    out = {"gbm": models["gbm"].predict(df[models["feats"]]),
+           "ridge": models["ridge"].predict(df[models["stock_feats"]].fillna(0.5))}
+    if "rank" in models:
+        out["rank"] = models["rank"].predict(df[models["feats"]])
+    return out
 
 
 def add_scores(df):
-    """綜合分數 + 產業/beta 中立分數"""
-    g = df.groupby("date")
-    df["gbm_r"] = g["gbm"].rank(pct=True)
-    df["ridge_r"] = g["ridge"].rank(pct=True)
-    df["ens"] = (df["gbm_r"] + df["ridge_r"]) / 2
-    # 中立化:對每一天,把綜合分數對「產業 + beta」做迴歸,取殘差
-    out = np.full(len(df), np.nan)
+    """綜合分數(各模型排名平均)→ 扣掉產業、beta、規模影響 → 產業中立分數"""
     df = df.reset_index(drop=True)
+    g = df.groupby("date")
+    parts = []
+    for m in ["gbm", "ridge", "rank"]:
+        if m in df:
+            df[m + "_r"] = g[m].rank(pct=True)
+            parts.append(m + "_r")
+    df["ens"] = df[parts].mean(axis=1)
+    out = np.full(len(df), np.nan)
     for _, d in df.groupby("date", sort=False):
         ii = d.index.values
         X = pd.get_dummies(d["industry"]).astype(float)
         X["beta"] = d["beta_60"].fillna(0.5).values
+        X["size"] = d["log_dollar_vol"].fillna(0.5).values
         y = d["ens"].values
         coef, *_ = np.linalg.lstsq(X.values, y, rcond=None)
         out[ii] = y - X.values @ coef
     df["neutral"] = out
+    df["neutral_r"] = df.groupby("date")["neutral"].rank(pct=True)
     return df
+
+
+def smooth_scores(df, col="neutral_r", days=SMOOTH_DAYS):
+    """每檔股票取最近 days 個交易日分數的平均,再重新排名"""
+    df = df.sort_values(["ticker", "date"])
+    df["smooth_raw"] = df.groupby("ticker")[col].transform(lambda s: s.rolling(days, min_periods=1).mean())
+    df["smooth"] = df.groupby("date")["smooth_raw"].rank(pct=True)
+    return df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+
+KEEP = ["date", "ticker", "industry", "beta_60", "log_dollar_vol", "ret_20"]
 
 
 def walk_forward(data, stock_feats, cfg):
@@ -516,45 +556,101 @@ def walk_forward(data, stock_feats, cfg):
         te = lab[lab["date"].isin(dates[i:i + step])]
         if len(tr) < 5000 or te.empty:
             continue
-        g, r, _ = fit_predict(tr, te, stock_feats, h)
-        out = te[["date", "ticker", "industry", "beta_60", "ret_20", f"fut_{h}"]].copy()
-        out = out.rename(columns={f"fut_{h}": "fut"})
-        out["gbm"], out["ridge"] = g, r
+        models = fit_models(tr, stock_feats, h)
+        out = te[KEEP + [f"fut_{h}"]].copy().rename(columns={f"fut_{h}": "fut"})
+        for m, v in predict_models(models, te).items():
+            out[m] = v
         preds.append(out)
         if k % 20 == 0:
             print(f"  [{cfg['name']}] {k + 1}/{len(steps)},{time.time() - t0:.0f} 秒")
-    pred = add_scores(pd.concat(preds))
-    pred["neutral_r"] = pred.groupby("date")["neutral"].rank(pct=True)
+    pred = smooth_scores(add_scores(pd.concat(preds)))
     pred["reversal"] = 1 - pred["ret_20"].fillna(0.5)
     pred["fut_rank"] = pred.groupby("date")["fut"].rank(pct=True)
     return pred
 
 
-SCORE_NAMES = {"ens": "綜合分數", "neutral": "產業/beta 中立", "gbm": GBM_NAME,
-               "ridge": "Ridge 線性", "reversal": "跌深反彈(基準)"}
+MAIN = "主要(中立+平滑)"
+MAIN_BT = "主要策略(含換股緩衝)"
+
+
+def score_names():
+    names = {"smooth": MAIN, "neutral": "產業中立(未平滑)", "ens": "綜合(未中立)",
+             "gbm": GBM_NAME, "ridge": "Ridge 線性"}
+    if make_ranker is not None:
+        names["rank"] = "LambdaRank 排序"
+    names["reversal"] = "跌深反彈(基準)"
+    return names
+
+
+def buffered_backtest(pred, reb_dates, col="smooth"):
+    """模擬實際持股:每期只換掉跌出前 TOP_N×BUFFER_MULT 名的股票,交易成本依實際換股比例計算"""
+    held, rets, turns = [], [], []
+    for d in reb_dates:
+        day = pred[pred["date"] == d].set_index("ticker")
+        order = day[col].sort_values(ascending=False).index.tolist()
+        keep_zone = set(order[:TOP_N * BUFFER_MULT])
+        new = [t for t in held if t in keep_zone]
+        for t in order:
+            if len(new) >= TOP_N:
+                break
+            if t not in new:
+                new.append(t)
+        turnover = 1.0 if not held else len(set(new) - set(held)) / TOP_N
+        rets.append(day.loc[new, "fut"].mean() - COST * turnover)
+        turns.append(turnover)
+        held = new
+    return rets, turns
 
 
 def evaluate(pred, h, market):
+    names = score_names()
     ic_rows = []
-    for m, name in SCORE_NAMES.items():
+    for m, name in names.items():
         p = pred.groupby("date")[m].rank(pct=True)
         ric = pred.assign(_p=p).groupby("date").apply(lambda d: d["_p"].corr(d["fut_rank"]))
         ic_rows.append({"model": name, "key": m, "ric": ric.mean(),
                         "icir": ric.mean() / ric.std(), "pos": (ric > 0).mean()})
     reb_dates = np.sort(pred["date"].unique())[::h]
     reb = pred[pred["date"].isin(reb_dates)].copy()
-    reb["q"] = np.ceil(reb.groupby("date")["neutral"].rank(pct=True) * 5).clip(1, 5).astype(int)
+    reb["q"] = np.ceil(reb.groupby("date")["smooth"].rank(pct=True) * 5).clip(1, 5).astype(int)
     quint = reb.groupby(["date", "q"])["fut"].mean().unstack().mean()
     mkt_fut = market.shift(-h) / market - 1
     rec = []
     for d in reb_dates:
         day = pred[pred["date"] == d]
         r = {"date": d, "全部股票平均": day["fut"].mean(), "加權指數": float(mkt_fut.loc[d])}
-        for m, name in SCORE_NAMES.items():
+        for m, name in names.items():
             r[name] = day.nlargest(TOP_N, m)["fut"].mean() - COST
         rec.append(r)
     bt = pd.DataFrame(rec).set_index("date")
-    return pd.DataFrame(ic_rows), quint, bt
+    rets, turns = buffered_backtest(pred, reb_dates)
+    bt.insert(0, MAIN_BT, rets)
+    return pd.DataFrame(ic_rows), quint, bt, float(np.mean(turns[1:])) if len(turns) > 1 else None
+
+
+def simulate(excess, h, n_boot=5000, seed=7):
+    """模擬驗證:
+    1) Bootstrap:把每期超額報酬重新抽樣 5000 次,估計「長期平均超額報酬 > 0」的機率與 95% 區間
+    2) PSR(Probabilistic Sharpe Ratio, Bailey & López de Prado):考慮樣本數、偏態、峰態後,Sharpe > 0 的機率
+    """
+    x = pd.Series(excess).dropna().values
+    n = len(x)
+    if n < 8:
+        return None
+    rng = np.random.default_rng(seed)
+    means = rng.choice(x, size=(n_boot, n), replace=True).mean(axis=1)
+    per_year = 252 / h
+    sr = x.mean() / x.std(ddof=1)
+    skew = pd.Series(x).skew()
+    kurt = pd.Series(x).kurt() + 3
+    from math import erf, sqrt
+    denom = sqrt(max(1e-12, 1 - skew * sr + (kurt - 1) / 4 * sr ** 2))
+    z = sr * sqrt(n - 1) / denom
+    psr = 0.5 * (1 + erf(z / sqrt(2)))
+    return {"n": n, "p_pos": float((means > 0).mean()),
+            "ci_lo": float(np.percentile(means, 2.5) * per_year),
+            "ci_hi": float(np.percentile(means, 97.5) * per_year),
+            "ann_excess": float(x.mean() * per_year), "psr": float(psr)}
 
 
 # ============================================================
@@ -568,21 +664,27 @@ def _c(x, nd=4):
     return None if np.isnan(x) else round(x, nd)
 
 
-def build_site(close, data, stock_feats, short_pred, short_eval, long_eval, latest, final_gbm):
+def build_site(close, short_pred, short_eval, long_eval, latest, importance):
     DOCS.mkdir(exist_ok=True)
     today = pd.Timestamp(latest["date"].iloc[0])
     today_str = today.strftime("%Y-%m-%d")
     h = SHORT["horizon"]
 
-    # 預測紀錄
+    # 預測紀錄(同一天重跑會覆蓋)
     hist_f = DOCS / "predictions_history.csv"
-    log = latest[["ticker", "name", "rank", "ens_pct", "neutral_pct", "long_pct", "close"]].copy()
+    log = latest[["ticker", "name", "rank", "main_pct", "raw_pct", "long_pct", "close"]].copy()
     log.insert(0, "date", today_str)
+    prev_rank = {}
     if hist_f.exists():
         hist = pd.read_csv(hist_f, dtype={"ticker": str, "date": str})
+        older = hist[hist["date"] < today_str]
+        if not older.empty:
+            last = older[older["date"] == older["date"].max()]
+            prev_rank = dict(zip(last["ticker"], last["rank"]))
         hist = pd.concat([hist[hist["date"] != today_str], log], ignore_index=True)
     else:
         hist = log
+    hist = hist.reindex(columns=log.columns)
     hist.to_csv(hist_f, index=False, encoding="utf-8-sig")
 
     idx = close.index
@@ -602,13 +704,15 @@ def build_site(close, data, stock_feats, short_pred, short_eval, long_eval, late
     live.sort(key=lambda r: r["date"], reverse=True)
     done = [r for r in live if r["diff"] is not None]
 
-    ic, quint, bt = short_eval
+    ic, quint, bt, turnover = short_eval
     cum = (1 + bt).cumprod()
     years = len(bt) * h / 252
     ann = cum.iloc[-1] ** (1 / years) - 1
     vol = bt.std() * np.sqrt(252 / h)
     win = (bt.sub(bt["全部股票平均"], axis=0) > 0).mean()
     yearly = (1 + bt).groupby(bt.index.year).prod() - 1
+    excess = bt[MAIN_BT] - bt["全部股票平均"]
+    sim = simulate(excess, h)
 
     lic = long_eval[0] if long_eval is not None else None
 
@@ -616,26 +720,26 @@ def build_site(close, data, stock_feats, short_pred, short_eval, long_eval, late
     reb = short_pred[short_pred["date"].isin(reb_dates)].sort_values("date")
     stocks_hist = {t: {"name": STOCKS.get(t, t),
                        "dates": [d.strftime("%Y-%m-%d") for d in g["date"]],
-                       "score": [_c(v, 3) for v in g["neutral_r"]],
+                       "score": [_c(v, 3) for v in g["smooth"]],
                        "actual": [_c(v, 3) for v in g["fut_rank"]],
                        "ret": [_c(v) for v in g["fut"]]}
                    for t, g in reb.groupby("ticker")}
 
-    imp = (pd.Series(final_gbm.feature_importances_, index=stock_feats + MKT_FEATS)
-           .sort_values(ascending=False).head(15)) if hasattr(final_gbm, "feature_importances_") else None
+    def pe(r):
+        ey = r.get("raw_earn_yield")
+        return _c(1 / ey, 1) if ey is not None and pd.notna(ey) and ey > 0 else None
 
     payload = {
         "date": today_str,
         "generated": (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M"),
-        "horizon": h, "topn": TOP_N, "n": len(latest),
+        "horizon": h, "topn": TOP_N, "n": len(latest), "smooth_days": SMOOTH_DAYS,
+        "main": MAIN, "main_bt": MAIN_BT, "turnover": _c(turnover, 3),
         "today": [{
             "rank": int(r["rank"]), "code": r["ticker"], "name": r["name"], "ind": r["industry"],
-            "score": _c(r["neutral_pct"], 3), "ens": _c(r["ens_pct"], 3),
-            "long": _c(r["long_pct"], 3), "ret20": _c(r["raw_ret_20"]),
-            "rev": _c(r.get("raw_rev_yoy")), "pe": _c(1 / r["raw_earn_yield"], 1)
-            if r.get("raw_earn_yield") not in (None, 0) and pd.notna(r.get("raw_earn_yield")) else None,
+            "score": _c(r["main_pct"], 3), "raw": _c(r["raw_pct"], 3), "long": _c(r["long_pct"], 3),
+            "chg": (int(prev_rank[r["ticker"]]) - int(r["rank"])) if r["ticker"] in prev_rank else None,
+            "ret20": _c(r["raw_ret_20"]), "rev": _c(r.get("raw_rev_yoy")), "pe": pe(r),
             "foreign": _c(r.get("raw_foreign_20")), "close": _c(r["close"], 2),
-            "watch": r["ticker"] in WATCHLIST,
         } for _, r in latest.iterrows()],
         "ic": [{"model": r["model"], "ric": _c(r["ric"]), "icir": _c(r["icir"], 3),
                 "pos": _c(r["pos"], 3)} for _, r in ic.iterrows()],
@@ -646,19 +750,20 @@ def build_site(close, data, stock_feats, short_pred, short_eval, long_eval, late
                      "sharpe": _c(ann[k] / vol[k], 2) if vol[k] else None,
                      "win": _c(win[k], 3)} for k in bt.columns],
         "yearly": {"years": [int(y) for y in yearly.index],
-                   "model": [_c(v) for v in yearly["產業/beta 中立"]],
-                   "ens": [_c(v) for v in yearly["綜合分數"]],
+                   "model": [_c(v) for v in yearly[MAIN_BT]],
+                   "raw": [_c(v) for v in yearly["產業中立(未平滑)"]],
                    "all": [_c(v) for v in yearly["全部股票平均"]]},
         "bt": {"dates": [d.strftime("%Y-%m-%d") for d in bt.index],
                **{k: [_c(v) for v in cum[name]] for k, name in
-                  [("ens", "綜合分數"), ("neutral", "產業/beta 中立"),
+                  [("main", MAIN_BT), ("raw", "產業中立(未平滑)"),
                    ("all", "全部股票平均"), ("market", "加權指數")]},
-               "excess": [_c(v) for v in (bt["產業/beta 中立"] - bt["全部股票平均"])]},
+               "excess": [_c(v) for v in excess]},
+        "sim": None if sim is None else {k: _c(v, 4) for k, v in sim.items()},
         "live": live,
         "live_win": _c(np.mean([r["diff"] > 0 for r in done])) if done else None,
         "live_n": len(done),
         "stocks": stocks_hist,
-        "importance": None if imp is None else {"names": list(imp.index), "values": [int(v) for v in imp.values]},
+        "importance": importance,
     }
     tpl = (ROOT / "dashboard_template.html").read_text(encoding="utf-8")
     html = tpl.replace("__DATA__", json.dumps(payload, ensure_ascii=False))
@@ -701,32 +806,38 @@ def main():
         long_eval = None
 
     print("== 5/5 今日預測與網站 ==")
-    today = data["date"].max()
-    latest = data[(data["date"] == today) & (~data["ticker"].isin(stale))].copy()
-    final = {}
+    dates = np.sort(data["date"].unique())
+    today = dates[-1]
+    recent = data[data["date"].isin(dates[-SMOOTH_DAYS:]) & (~data["ticker"].isin(stale))].copy()
+    latest = data[(data["date"] == today) & (~data["ticker"].isin(stale))].copy().reset_index(drop=True)
+    importance = None
     for cfg in (SHORT, LONG):
         h = cfg["horizon"]
         lab = data.dropna(subset=[f"target_{h}"])
         end = lab["date"].max()
-        tr = lab[lab["date"] >= end - np.timedelta64(365 * TRAIN_YEARS, "D")]
-        g, r, gbm = fit_predict(tr, latest, stock_feats, h)
-        final[h] = gbm
-        tmp = latest[["date", "industry", "beta_60"]].copy()
-        tmp["gbm"], tmp["ridge"] = g, r
-        tmp = add_scores(tmp)
+        models = fit_models(lab[lab["date"] >= end - np.timedelta64(365 * TRAIN_YEARS, "D")], stock_feats, h)
+        tmp = recent[KEEP].copy()
+        for m, v in predict_models(models, recent).items():
+            tmp[m] = v
+        tmp = smooth_scores(add_scores(tmp))
+        tmp = tmp[tmp["date"] == today].set_index("ticker")
         if cfg is SHORT:
-            latest["ens_pct"] = tmp["ens"].rank(pct=True).values
-            latest["neutral_pct"] = tmp["neutral"].rank(pct=True).values
+            latest["main_pct"] = latest["ticker"].map(tmp["smooth"])
+            latest["raw_pct"] = latest["ticker"].map(tmp["neutral_r"])
+            gbm = models["gbm"]
+            if hasattr(gbm, "feature_importances_"):
+                imp = pd.Series(gbm.feature_importances_, index=models["feats"]).sort_values(ascending=False).head(15)
+                importance = {"names": list(imp.index), "values": [int(v) for v in imp.values]}
         else:
-            latest["long_pct"] = tmp["neutral"].rank(pct=True).values
-    latest["rank"] = latest["neutral_pct"].rank(ascending=False, method="first").astype(int)
+            latest["long_pct"] = latest["ticker"].map(tmp["smooth"])
+    latest["rank"] = latest["main_pct"].rank(ascending=False, method="first").astype(int)
     latest["name"] = latest["ticker"].map(STOCKS)
     latest["close"] = latest["ticker"].map(close.loc[today])
     latest = latest.sort_values("rank")
     for k in ["raw_rev_yoy", "raw_earn_yield", "raw_foreign_20"]:
         if k not in latest:
             latest[k] = np.nan
-    build_site(close, data, stock_feats, short_pred, short_eval, long_eval, latest, final[SHORT["horizon"]])
+    build_site(close, short_pred, short_eval, long_eval, latest, importance)
     print(f"完成,共花 {(time.time() - t0) / 60:.1f} 分鐘")
 
 
